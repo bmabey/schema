@@ -1,8 +1,10 @@
 (ns schema.client.objc
-  (:use plumbing.core)
+  "Generate Objective-C domain classes from a limited subset of schemas. For instance,
+    (s/defschema Person {:name String :birth-day long :age int :height double})
+    will generate this https://gist.github.com/aria42/2bffe6ba8176f21d1911"
   (:require [clojure.string :as str]
             [schema.core :as s]
-            [schema.utils :as s])
+            [schema.utils :as utils])
   (:import [schema.core EnumSchema NamedSchema OptionalKey]))
 
 
@@ -12,8 +14,11 @@
 (s/defschema StorageAttribute
   (s/enum :strong :weak :readWrite :copy))
 
+(s/defschema ObjcPrimitiveNumberType
+  (s/enum :NSInteger :long-long :CGFloat))
+
 (s/defschema ObjcAtomType
-  (s/enum :NSInteger :long-long :NSString :CGFloat))
+  (s/either ObjcPrimitiveNumberType (s/eq :NSString)))
 
 (s/defschema NamedEnumSchema
   (s/both NamedSchema (s/pred #(instance? EnumSchema (:schema %)))))
@@ -51,7 +56,7 @@
   [objc-type :- ObjcType]
   ;; TODO: pretty this up
   (and (s/check NamedEnumSchema objc-type)
-       (not (#{:long-long} objc-type))))
+       (s/check ObjcPrimitiveNumberType objc-type)))
 
 (s/defn analyze-property :- Property
   [[k v]]
@@ -67,8 +72,7 @@
      :optional? optional?}))
 
 (s/defn analyze-map :- ClassSpec
-  [schema]
-  (assert (instance? NamedSchema schema))
+  [schema :- NamedSchema]
   {:class-name (utils/safe-get schema :name)
    :properties (map analyze-property (utils/safe-get schema :schema))})
 
@@ -77,8 +81,8 @@
   (set (filter string? (map :type (:properties class-spec)))))
 
 (s/defn pull-out-enums :- ClassSpec
-  [{:keys [properties class-name] :as class-spec} :- ClassSpec]
   "Pulls out ObjcEnum types into :dynamic-enums"
+  [{:keys [properties class-name] :as class-spec} :- ClassSpec]
   (let [enum-name (fn [p] (lisp->camel-case (str class-name "-" (:name p))))]
     (assoc class-spec
       :properties
@@ -95,35 +99,52 @@
 ;;; Class Emission
 
 (s/defn property-type-name :- String
-  [property :- Property]
   "Generates the class name for a given Prop"
+  [property :- Property]
   (let [property-type (utils/safe-get property :type)]
     (if (not (s/check NamedEnumSchema property-type))
       (:name property-type)
       (name property-type))))
+
+(s/defn number-cast :- String
+  [num-type :- ObjcPrimitiveNumberType
+   data-val :- String]
+  (format "((NSNumber *) %s).%sValue"
+          data-val
+          (case num-type
+            :long-long "longLong"
+            :CGFloat "float"
+            :NSInteger "integer")))
 
 (s/defn obj-reference :- String
   [property :- Property]
   (let [object? (utils/safe-get property :object?)]
     (str (.replace (property-type-name property) "-" " ") (when object? " *"))))
 
+(s/defn obj-cast :- String
+  [property :- Property data-val :- String]
+  (let [prop-type (utils/safe-get property :type)]
+    (cond
+     (utils/safe-get property :object?) (format "(%s) %s" (obj-reference property) data-val)
+     (nil? (s/check ObjcPrimitiveNumberType prop-type)) (number-cast prop-type data-val)
+     :else (throw (RuntimeException. (str "Don't know how to cast " property))))))
+
 (s/defn emit-property :- String
   [property :- Property]
-  (let [property-name (name (utils/safe-get property :name))]
-    (format
-     "@property (%s%s) %s %s;"
-     (if (utils/safe-get property :atomic?)
-       "atomic"
-       "nonatomic")
-     (if-let [storage (utils/safe-get property :storage)]
-       (str "," (name storage))
-       "")
-     (obj-reference property)
-     (str property-name))))
+  (format
+   "@property (%s%s) %s %s;"
+   (if (utils/safe-get property :atomic?)
+     "atomic"
+     "nonatomic")
+   (if-let [storage (utils/safe-get property :storage)]
+     (str "," (name storage))
+     "")
+   (obj-reference property)
+   (name (utils/safe-get property :name))))
 
 (s/defn emit-dynamic-enum :- String
   [enum-schema :- NamedEnumSchema]
-  (let [enum-names (->> (utils/safe-get-in enum-schema [:schema :vs])
+  (let [enum-names (->> (get-in enum-schema [:schema :vs])
                         (map #(lisp->camel-case (str (:name enum-schema) "-" (name %)))))]
     (format
      "typedef enum {\n%s\n} %s;"
@@ -201,7 +222,7 @@
          ;; TODO(iw): verify we don't need special casting rules
          ;; Simple assignment
          (not (s/check ObjcAtomType property-type))
-         (format "(%s) %s" (obj-reference p) data-val)
+         (obj-cast p data-val)
 
          ;; Enum
          (not (s/check NamedEnumSchema property-type))
@@ -258,7 +279,7 @@
 
 (comment
   ;; Test schemas for write-class!
-  (s/defschema Person {:name String :birth-day Long})
+  (s/defschema Person {:name String :birth-day long :age int :height double})
   (s/defschema Author {:name String (s/optional-key :url) String})
 
   (s/defschema PersonId
